@@ -22,6 +22,13 @@ import tensorflow.contrib.slim as slim
 import scipy.misc
 import matplotlib.pyplot as plt
 
+from tqdm import tqdm
+from glob import glob
+import cv2
+import os
+import datetime
+from tensorflow.python.client import device_lib
+
 from monodepth_model import *
 from monodepth_dataloader import *
 from average_gradients import *
@@ -29,12 +36,27 @@ from average_gradients import *
 parser = argparse.ArgumentParser(description='Monodepth TensorFlow implementation.')
 
 parser.add_argument('--encoder',          type=str,   help='type of encoder, vgg or resnet50', default='vgg')
-parser.add_argument('--image_path',       type=str,   help='path to the image', required=True)
+parser.add_argument('--image_pattern',       type=str,   help='glob patter for images', required=True)
 parser.add_argument('--checkpoint_path',  type=str,   help='path to a specific checkpoint to load', required=True)
 parser.add_argument('--input_height',     type=int,   help='input height', default=256)
 parser.add_argument('--input_width',      type=int,   help='input width', default=512)
 
 args = parser.parse_args()
+
+
+def getGPUname():
+    local_device_protos = device_lib.list_local_devices()
+    l = [x.physical_device_desc for x in local_device_protos if x.device_type == 'GPU']
+    s=''
+    for t in l:
+        s+=t[t.find("name: ")+len("name: "):t.find(", pci")] + " "
+    return s
+
+
+GPU_NAME = getGPUname()
+if GPU_NAME=='':
+    GPU_NAME="CPU"
+
 
 def post_process_disparity(disp):
     _, h, w = disp.shape
@@ -51,12 +73,9 @@ def test_simple(params):
 
     left  = tf.placeholder(tf.float32, [2, args.input_height, args.input_width, 3])
     model = MonodepthModel(params, "test", left, None)
+    time_sum = 0
+    counter = 0
 
-    input_image = scipy.misc.imread(args.image_path, mode="RGB")
-    original_height, original_width, num_channels = input_image.shape
-    input_image = scipy.misc.imresize(input_image, [args.input_height, args.input_width], interp='lanczos')
-    input_image = input_image.astype(np.float32) / 255
-    input_images = np.stack((input_image, np.fliplr(input_image)), 0)
 
     # SESSION
     config = tf.ConfigProto(allow_soft_placement=True)
@@ -64,26 +83,58 @@ def test_simple(params):
 
     # SAVER
     train_saver = tf.train.Saver()
-
     # INIT
     sess.run(tf.global_variables_initializer())
     sess.run(tf.local_variables_initializer())
     coordinator = tf.train.Coordinator()
     threads = tf.train.start_queue_runners(sess=sess, coord=coordinator)
 
-    # RESTORE
-    restore_path = args.checkpoint_path.split(".")[0]
-    train_saver.restore(sess, restore_path)
 
-    disp = sess.run(model.disp_left_est[0], feed_dict={left: input_images})
-    disp_pp = post_process_disparity(disp.squeeze()).astype(np.float32)
+    for image_path in tqdm(sorted(glob(args.image_pattern))):
+        input_image = scipy.misc.imread(image_path, mode="RGB")
+        original_height, original_width, num_channels = input_image.shape
+        input_image = scipy.misc.imresize(input_image, [args.input_height, args.input_width], interp='lanczos')
+        input_image = input_image.astype(np.float32) / 255
+        input_images = np.stack((input_image, np.fliplr(input_image)), 0)
 
-    output_directory = os.path.dirname(args.image_path)
-    output_name = os.path.splitext(os.path.basename(args.image_path))[0]
+        start = datetime.datetime.now()
 
-    np.save(os.path.join(output_directory, "{}_disp.npy".format(output_name)), disp_pp)
-    disp_to_img = scipy.misc.imresize(disp_pp.squeeze(), [original_height, original_width])
-    plt.imsave(os.path.join(output_directory, "{}_disp.png".format(output_name)), disp_to_img, cmap='plasma')
+
+
+
+
+        # RESTORE
+        restore_path = args.checkpoint_path.split(".")[0]
+        train_saver.restore(sess, restore_path)
+
+        disp = sess.run(model.disp_left_est[0], feed_dict={left: input_images})
+        disp_pp = post_process_disparity(disp.squeeze()).astype(np.float32)
+
+        # End time
+        end = datetime.datetime.now()
+        # Time elapsed
+        diff = end - start
+
+        time_sum += diff.microseconds/1000.0
+
+
+        output_directory = os.path.dirname(image_path)
+        output_name = os.path.splitext(os.path.basename(image_path))[0]
+
+        # np.save(os.path.join(output_directory, "{}_disp.npy".format(output_name)), disp_pp)
+        disp_to_img = scipy.misc.imresize(disp_pp.squeeze(), [original_height, original_width])
+        plt.imsave(os.path.join(output_directory, "{}_disp.png".format(output_name)), disp_to_img, cmap='plasma')
+
+        image_np = cv2.imread(os.path.join(output_directory, "{}_disp.png".format(output_name)))
+        cv2.putText(image_np,'%s %s'%(GPU_NAME,args.checkpoint_path.split('/')[-1]),(100,100), cv2.FONT_HERSHEY_SIMPLEX, 3,(0,0,0),16,cv2.LINE_AA)
+        cv2.putText(image_np,'%s %s'%(GPU_NAME,args.checkpoint_path.split('/')[-1]),(100,100), cv2.FONT_HERSHEY_SIMPLEX, 3,(255,255,255),10,cv2.LINE_AA)
+
+        cv2.putText(image_np,'Prediction time: %.0fms (%.1f fps) AVG: %.0fms (%.1f fps)'%(diff.microseconds/1000.0,1000000.0/diff.microseconds,time_sum/(counter+1),1000.0/(time_sum/(counter+1))),(100, 200), cv2.FONT_HERSHEY_SIMPLEX, 3,(0,0,0),16,cv2.LINE_AA)
+        cv2.putText(image_np,'Prediction time: %.0fms (%.1f fps) AVG: %.0fms (%.1f fps)'%(diff.microseconds/1000.0,1000000.0/diff.microseconds,time_sum/(counter+1),1000.0/(time_sum/(counter+1))),(100, 200), cv2.FONT_HERSHEY_SIMPLEX, 3,(255,255,255),10,cv2.LINE_AA)
+
+        cv2.imwrite(os.path.join(output_directory, "{}_disp.jpg".format(output_name)),image_np)
+        os.remove(os.path.join(output_directory, "{}_disp.png".format(output_name)))
+        counter = counter + 1
 
     print('done!')
 
